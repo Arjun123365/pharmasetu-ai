@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "test": "vitest run",
     "preview": "vite preview --host 0.0.0.0",
-    "test:browser": "node browser-test.mjs"
+    "test:browser": "node browser-test.mjs",
+    "demo:record": "node record-demo.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.1.0",

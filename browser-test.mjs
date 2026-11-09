@@ -51,13 +51,28 @@ try {
   );
   assert.equal(saved.batches[1].quantity, 25);
   assert.equal(saved.audit.length, 1);
+  // Older ledgers have no seedRevision. Loading must preserve their transactions.
+  delete saved.seedRevision;
+  const legacyRaw = JSON.stringify(saved);
+  await page.evaluate(
+    (raw) => localStorage.setItem("pharmasetu-demo-v1", raw),
+    legacyRaw,
+  );
   await page.reload();
+  await page
+    .getByRole("status")
+    .filter({ hasText: "saved demo ledger is preserved" })
+    .waitFor();
+  assert.equal(
+    await page.evaluate(() => localStorage.getItem("pharmasetu-demo-v1")),
+    legacyRaw,
+  );
   saved = await page.evaluate(() =>
     JSON.parse(localStorage.getItem("pharmasetu-demo-v1")),
   );
   assert.equal(saved.batches[1].quantity, 25);
   await nav("Stock-out warnings");
-  await page.getByRole("button", { name: /Warning \d/ }).click();
+  await page.getByRole("button", { name: /Low Stock \d/ }).click();
   await nav("Expiry monitoring");
   await page.getByRole("combobox").nth(2).selectOption("expired");
   await page.getByRole("heading", { name: "Batch expiry review" }).waitFor();
@@ -73,6 +88,30 @@ try {
     JSON.parse(localStorage.getItem("pharmasetu-demo-v1")),
   );
   assert.equal(saved.requests[0].status, "Approved");
+  const approved = saved.requests[0];
+  await nav("Inventory management");
+  await page.getByLabel("Filter product").selectOption(approved.sku);
+  await page
+    .getByLabel("Filter distributor location")
+    .selectOption(approved.location);
+  await page
+    .getByRole("button", { name: "Receive / adjust", exact: true })
+    .nth(1)
+    .click();
+  const delivery = Math.min(5, approved.quantity);
+  await page.getByLabel("Change in packs").fill(String(delivery));
+  await page
+    .getByLabel("Mandatory movement reason")
+    .fill("Receipt against confirmed incoming");
+  await page
+    .getByLabel("Match confirmed incoming", { exact: true })
+    .selectOption(approved.id);
+  await page.getByRole("button", { name: "Save movement" }).click();
+  saved = await page.evaluate(() =>
+    JSON.parse(localStorage.getItem("pharmasetu-demo-v1")),
+  );
+  assert.equal(saved.requests[0].received, delivery);
+  await page.getByRole("button", { name: "Clear filters" }).click();
   await nav("Reports & analytics");
   const downloadPromise = page.waitForEvent("download");
   await page.getByRole("button", { name: "Export CSV" }).click();
@@ -100,11 +139,26 @@ try {
   saved = await page.evaluate(() =>
     JSON.parse(localStorage.getItem("pharmasetu-demo-v1")),
   );
+  assert.equal(saved.seedRevision, 2);
   assert.equal(saved.audit.length, 0);
   assert.equal(saved.requests.length, 0);
   await page.setViewportSize({ width: 390, height: 844 });
   await page.getByRole("button", { name: "Toggle navigation" }).click();
   await nav("Overview");
+  await page
+    .getByText("How these metrics are calculated", { exact: true })
+    .click();
+  await page
+    .getByText("All figures respect the selected filters.", { exact: false })
+    .waitFor();
+  await page
+    .getByText("How these metrics are calculated", { exact: true })
+    .click();
+  await page
+    .getByLabel("Search medicines, SKU or location")
+    .fill("no-such-medicine");
+  assert.match(await page.locator(".availability").innerText(), /N\/A/);
+  await page.getByRole("button", { name: "Clear filters" }).click();
   await page.screenshot({ path: "test-results/mobile.png", fullPage: true });
   assert.equal(
     await page.evaluate(
@@ -115,7 +169,7 @@ try {
   );
   assert.deepEqual(errors, []);
   console.log(
-    "PASS: seven-module navigation, filters, negative-stock validation, stock receipt, persistence, request workflow, CSV content/download, print action/PDF rendering, reset cancel/confirm, mobile viewport, no browser errors.",
+    "PASS: seven-module navigation, filters, negative-stock validation, stock receipt, legacy ledger persistence, matched incoming receipt, request workflow, CSV content/download, print action/PDF rendering, reset cancel/confirm, mobile viewport, no browser errors.",
   );
 } finally {
   await browser.close();

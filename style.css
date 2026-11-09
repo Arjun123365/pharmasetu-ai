@@ -1238,3 +1238,112 @@ footer span:first-child {
     display: none !important;
   }
 }
+
+/* KPI validation: exclusive position statuses and readable metric definitions. */
+.kpis {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  row-gap: 24px;
+}
+.kpi:nth-child(4n) {
+  border-right: 0;
+}
+.kpi:nth-child(3) {
+  border-right: 1px solid #ffffff1c;
+}
+.kpi-label {
+  white-space: normal;
+  line-height: 1.5;
+}
+.metric-out-of-stock strong,
+.metric-critical strong {
+  color: #ffb3bd;
+}
+.metric-low-stock strong {
+  color: #ffd88d;
+}
+.metric-expired strong {
+  color: #ffb3bd;
+}
+.badge.out-of-stock {
+  background: #fae2e7;
+  color: #a72d49;
+  font-weight: 750;
+}
+.badge.low-stock {
+  background: #fff2d5;
+  color: #946009;
+}
+.badge.critical {
+  background: #fff0f0;
+  color: #c13542;
+}
+.amber-text {
+  color: #946009 !important;
+}
+.metric-guide {
+  background: white;
+  border: 1px solid #dbe3f0;
+  border-radius: 8px;
+  padding: 14px 17px;
+  margin-bottom: 15px;
+  font-size: 12px;
+  color: #536985;
+}
+.metric-guide summary {
+  cursor: pointer;
+  font-weight: 650;
+  color: #365d9c;
+}
+.metric-guide p {
+  margin-top: 12px;
+  line-height: 1.8;
+}
+.scope-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-bottom: 20px;
+  font-size: 11px;
+  color: #6c7e96;
+}
+.metric-guide summary:focus-visible {
+  outline: 2px solid #6e93f7;
+  outline-offset: 4px;
+}
+.modal select {
+  display: block;
+  margin-top: 8px;
+  width: 100%;
+}
+@media (max-width: 1200px) {
+  .kpis {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+@media (max-width: 600px) {
+  .kpis {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .kpi:nth-child(even) {
+    border-right: 0;
+  }
+  .kpi:nth-child(3) {
+    border-right: 1px solid #ffffff1c;
+  }
+  .kpi-label {
+    font-size: 10px;
+  }
+  .scope-summary {
+    gap: 5px;
+  }
+}
+.alert-icon.low-stock {
+  color: #946009;
+  background: #fff2d5;
+}
+.alert-icon.out-of-stock {
+  color: #a72d49;
+  background: #fae2e7;
+}

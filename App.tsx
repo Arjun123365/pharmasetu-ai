@@ -43,7 +43,11 @@ import {
   daysLeft,
   changeStock,
   csv,
-  validState,
+  restoreDemo,
+  storageKey,
+  summarizePositions,
+  expirySummary,
+  confirmedIncoming,
   today,
   type State,
 } from "./model";
@@ -58,22 +62,17 @@ const modules = [
 ] as const;
 const colors = ["#315cf5", "#28bda0", "#80a6ff", "#ffbd5a", "#a48af5"];
 const fmt = (n: number) => Math.round(n).toLocaleString("en-IN");
-const storageKey = "pharmasetu-demo-v1";
 let loadNotice = "";
 function load(): State {
   try {
-    const raw = localStorage.getItem(storageKey);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (validState(parsed)) return parsed;
-      loadNotice =
-        "Saved demo data was invalid. A fresh synthetic dataset has been loaded.";
-    }
+    const restored = restoreDemo(localStorage.getItem(storageKey));
+    loadNotice = restored.notice;
+    return restored.state;
   } catch {
     loadNotice =
       "Browser storage could not be read. Using a fresh demo dataset.";
+    return seed();
   }
-  return seed();
 }
 function Badge({ value }: { value: string }) {
   return (
@@ -146,7 +145,8 @@ export default function App() {
     [edit, setEdit] = useState<string | null>(null),
     [delta, setDelta] = useState(""),
     [reason, setReason] = useState(""),
-    [error, setError] = useState("");
+    [error, setError] = useState(""),
+    [receiptRequest, setReceiptRequest] = useState("");
   const save = (next: State) => {
     setState(next);
     try {
@@ -163,7 +163,7 @@ export default function App() {
       (!sku || r.product.id === sku) &&
       (!loc || r.location.id === loc) &&
       (!search ||
-        `${r.product.name} ${r.product.id} ${r.product.category} ${r.location.city}`
+        `${r.product.name} ${r.product.id} ${r.product.category} ${r.product.form} ${r.location.city} ${r.location.name}`
           .toLowerCase()
           .includes(search.toLowerCase())),
   );
@@ -172,29 +172,31 @@ export default function App() {
       (!sku || b.sku === sku) &&
       (!loc || b.location === loc) &&
       (!search ||
-        `${products.find((p) => p.id === b.sku)?.name} ${b.id} ${b.sku}`
+        `${products.find((p) => p.id === b.sku)?.name} ${products.find((p) => p.id === b.sku)?.category} ${products.find((p) => p.id === b.sku)?.form} ${locations.find((l) => l.id === b.location)?.city} ${locations.find((l) => l.id === b.location)?.name} ${b.id} ${b.sku}`
           .toLowerCase()
           .includes(search.toLowerCase())),
   );
-  const stock = filtered.reduce((s, r) => s + r.stock, 0),
-    out = filtered.filter((r) => r.stock === 0),
-    low = filtered.filter((r) => r.stock > 0 && r.status !== "Healthy");
-  const exp = batches.filter((b) => b.quantity > 0 && daysLeft(b.expiry) <= 90);
+  const metrics = summarizePositions(filtered);
+  const stock = metrics.usable;
+  const out = filtered.filter((r) => r.status === "Out of Stock");
+  const expiry = expirySummary(batches);
+  const exp = expiry.within90;
+  const allExpiryRisk = [...expiry.expired, ...exp];
+  const positionKeys = new Set(filtered.map((r) => r.key));
+  const visibleRequests = state.requests.filter((r) =>
+    positionKeys.has(r.sku + r.location),
+  );
   const pending = state.requests.filter(
     (r) =>
       r.status !== "Approved" &&
       (!sku || r.sku === sku) &&
-      (!loc || r.location === loc),
+      (!loc || r.location === loc) &&
+      positionKeys.has(r.sku + r.location),
   );
   const weekly = Array.from({ length: 12 }, (_, week) => ({
     week: `W${week + 1}`,
     demand: state.sales
-      .filter(
-        (s) =>
-          s.week === week &&
-          (!sku || s.sku === sku) &&
-          (!loc || s.location === loc),
-      )
+      .filter((s) => s.week === week && positionKeys.has(s.sku + s.location))
       .reduce((v, s) => v + s.quantity, 0),
   }));
   const moving = weekly.slice(-4).reduce((s, w) => s + w.demand, 0) / 4;
@@ -214,7 +216,9 @@ export default function App() {
         .filter((r) => r.location.id === l.id)
         .reduce((s, r) => s + r.stock, 0),
       demand: state.sales
-        .filter((s) => s.location === l.id && (!sku || s.sku === sku))
+        .filter(
+          (s) => s.location === l.id && positionKeys.has(s.sku + s.location),
+        )
         .reduce((v, s) => v + s.quantity, 0),
     }));
   const categories = [...new Set(products.map((p) => p.category))].map(
@@ -236,7 +240,11 @@ export default function App() {
   );
   const alertRows = filtered
     .filter((r) => r.status !== "Healthy")
-    .sort((a, b) => a.coverage - b.coverage);
+    .sort(
+      (a, b) =>
+        Number(b.stock === 0) - Number(a.stock === 0) ||
+        a.coverage - b.coverage,
+    );
   const exportRows = filtered.map((r) => ({
     SKU: r.product.id,
     Medicine: r.product.name,
@@ -245,7 +253,7 @@ export default function App() {
     "Daily demand": r.daily.toFixed(2),
     "Coverage days": Number.isFinite(r.coverage)
       ? r.coverage.toFixed(1)
-      : "No demand",
+      : "N/A · no recent demand",
     Status: r.status,
     "Suggested packs": r.quantity,
   }));
@@ -261,7 +269,7 @@ export default function App() {
     .sort((a, b) => a.expiry.localeCompare(b.expiry));
   const reportData: Record<string, unknown>[] =
     report === "Expiry risk"
-      ? [...exp]
+      ? [...allExpiryRisk]
           .sort((a, b) => a.expiry.localeCompare(b.expiry))
           .map((b) => ({
             Batch: b.id,
@@ -292,6 +300,7 @@ export default function App() {
             ? exportRows.filter((r) => r.Status !== "Healthy")
             : exportRows;
   function navigate(i: number) {
+    window.scrollTo({ top: 0, behavior: "instant" });
     setActive(i);
     setSearch("");
     setMobile(false);
@@ -342,7 +351,7 @@ export default function App() {
         <Search size={17} />
         <input
           aria-label="Search medicines, SKU or location"
-          placeholder="Search medicine or SKU…"
+          placeholder="Search medicine, SKU or location…"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
         />
@@ -458,7 +467,7 @@ export default function App() {
               <td>
                 {Number.isFinite(r.coverage)
                   ? r.coverage.toFixed(1) + " days"
-                  : "No demand"}
+                  : "N/A · no recent demand"}
               </td>
               <td>{r.lead} days</td>
               <td>
@@ -468,9 +477,11 @@ export default function App() {
                     ? "No usable inventory"
                     : r.status === "Critical"
                       ? "Coverage is at or below lead time"
-                      : r.status === "Warning"
+                      : r.status === "Low Stock"
                         ? "Within 7 days of lead time"
-                        : "Coverage exceeds lead time + 7 days"}
+                        : r.daily === 0
+                          ? "No demand in the last four weeks; no demand-driven reorder"
+                          : "Coverage exceeds lead time + 7 days"}
                 </small>
               </td>
             </tr>
@@ -514,7 +525,14 @@ export default function App() {
               <Icon size={19} />
               <span>{label}</span>
               {i === 3 && (
-                <em>{all.filter((r) => r.status === "Critical").length}</em>
+                <em>
+                  {
+                    all.filter(
+                      (r) =>
+                        r.status === "Critical" || r.status === "Out of Stock",
+                    ).length
+                  }
+                </em>
               )}
             </button>
           ))}
@@ -594,6 +612,7 @@ export default function App() {
               <span className="live-dot" /> Demo snapshot{" "}
               <b>
                 {new Date().toLocaleDateString("en-IN", {
+                  timeZone: "Asia/Kolkata",
                   day: "numeric",
                   month: "short",
                   year: "numeric",
@@ -610,42 +629,71 @@ export default function App() {
                     Package,
                     "Usable inventory",
                     fmt(stock),
-                    "packs · expired stock excluded",
+                    "packs · in-date only",
+                    "Sum of packs in batches whose expiry is today or later; expired packs are excluded.",
                   ],
                   [
                     Activity,
-                    "Active medicine SKUs",
-                    new Set(filtered.map((r) => r.product.id)).size,
-                    "across selected locations",
+                    "Active SKUs",
+                    metrics.activeSkus,
+                    "distinct medicines in scope",
+                    "Unique catalogue medicines in the selected scope, regardless of stock balance.",
+                  ],
+                  [
+                    MapPin,
+                    "SKU-location positions",
+                    metrics.positions,
+                    "one medicine × one location",
+                    "Denominator for stock statuses and availability. A medicine can have a different status in each location.",
                   ],
                   [
                     ShieldAlert,
-                    "SKUs with low stock",
-                    new Set(low.map((r) => r.product.id)).size,
-                    `${low.length} SKU-location positions`,
-                  ],
-                  [
-                    X,
-                    "SKUs with stock-outs",
-                    new Set(out.map((r) => r.product.id)).size,
-                    `${out.length} SKU-location positions`,
+                    "Critical positions",
+                    metrics.critical,
+                    "positive stock · at risk",
+                    "Positive usable stock with coverage at or below that location’s lead time; zero-stock positions are separate.",
                   ],
                   [
                     Clock,
-                    "Expiry-risk batches",
-                    exp.length,
-                    "expired or due within 90 days",
+                    "Low-stock positions",
+                    metrics.low,
+                    "within the 7-day buffer",
+                    "Positive usable stock with coverage above lead time but at or below lead time + 7 days. Excludes Critical and Out of Stock.",
                   ],
                   [
-                    Truck,
-                    "Open requests",
-                    pending.length,
-                    "draft + pending approval",
+                    X,
+                    "Out-of-stock positions",
+                    metrics.out,
+                    "zero usable packs",
+                    "SKU-location positions with zero usable inventory, even if expired packs remain.",
                   ],
-                ].map(([Icon, label, value, caption]) => {
+                  [
+                    Clock,
+                    "Expired batches",
+                    expiry.expired.length,
+                    "stocked batches · excluded",
+                    "Batches with positive quantity and an expiry date before today; not included in future expiry counts.",
+                  ],
+                  [
+                    Clock,
+                    "Expiring in 90 days",
+                    exp.length,
+                    "stocked batches · not expired",
+                    "Positive-stock batches expiring today through 90 days from today, inclusive. Does not include expired batches.",
+                  ],
+                ].map(([Icon, label, value, caption, definition]) => {
                   const I = Icon as typeof Package;
                   return (
-                    <div className="kpi" key={String(label)}>
+                    <div
+                      className={
+                        "kpi metric-" +
+                        String(label).split(" ")[0].toLowerCase()
+                      }
+                      key={String(label)}
+                      tabIndex={0}
+                      title={String(definition)}
+                      aria-label={`${label}: ${value}. ${definition}`}
+                    >
                       <div className="kpi-label">
                         <I size={16} />
                         {String(label)}
@@ -667,20 +715,62 @@ export default function App() {
                 <span>
                   <CheckCircle2 size={19} />{" "}
                   <b>
-                    {filtered.length
-                      ? Math.round(
-                          ((filtered.length - out.length) / filtered.length) *
-                            100,
-                        )
-                      : 0}
-                    %
+                    {metrics.availability === null
+                      ? "N/A"
+                      : Math.round(metrics.availability)}
+                    {metrics.availability === null ? "" : "%"}
                   </b>{" "}
                   inventory availability
                 </span>
                 <p>
-                  Share of selected SKU-location positions with usable stock ·
-                  not a service-level estimate
+                  {metrics.positions - out.length} stocked / {metrics.positions}{" "}
+                  selected positions · not order fulfilment or a service-level
+                  estimate
                 </p>
+              </div>
+              <details className="metric-guide">
+                <summary>How these metrics are calculated</summary>
+                <p>
+                  All figures respect the selected filters. Active SKUs count
+                  unique medicines; stock statuses count SKU-location positions.
+                  Healthy {metrics.healthy} + Low Stock {metrics.low} + Critical{" "}
+                  {metrics.critical} + Out of Stock {metrics.out} ={" "}
+                  {metrics.positions} positions. A single SKU may be healthy at
+                  one location and out of stock at another.
+                </p>
+                <p>
+                  Average daily demand = weeks 9–12 ÷ 28. Coverage = usable
+                  packs ÷ daily demand. Out of Stock means zero usable packs;
+                  Critical means positive stock and coverage ≤ lead days; Low
+                  Stock means lead days &lt; coverage ≤ lead days + 7; Healthy
+                  means above this buffer, or positive stock with zero recent
+                  demand. No-demand coverage is shown as N/A, not a finite
+                  estimate.
+                </p>
+                <p>
+                  Availability = stocked positions ÷ all selected positions ×
+                  100. It is not actual order fulfilment. No matching positions
+                  yields N/A.
+                </p>
+                <p>
+                  Expiry uses calendar dates in India (Asia/Kolkata), with the
+                  expiry date itself considered in date for this demonstration.
+                  Stocked batch counts: expired {expiry.expired.length}; due
+                  0–30 days {expiry.within30.length}; due 31–60 days{" "}
+                  {expiry.days31to60.length}; due 61–90 days{" "}
+                  {expiry.days61to90.length}. These exclusive bands do not
+                  overlap. The 30/60/90-day filters are cumulative and must not
+                  be added together.
+                </p>
+              </details>
+              <div className="scope-summary">
+                <span>
+                  <Badge value="Healthy" /> {metrics.healthy} healthy positions
+                </span>
+                <button className="text-button" onClick={() => navigate(5)}>
+                  <Truck size={14} /> {pending.length} open demo replenishment
+                  requests <ChevronRight size={14} />
+                </button>
               </div>
               <div className="grid-main">
                 <Card
@@ -715,6 +805,10 @@ export default function App() {
                           tickLine={false}
                         />
                         <Tooltip />
+                        <Legend
+                          iconType="circle"
+                          wrapperStyle={{ fontSize: 11 }}
+                        />
                         <Bar
                           isAnimationActive={false}
                           name="Usable packs"
@@ -730,7 +824,7 @@ export default function App() {
               </div>
               <div className="grid-three">
                 <Card
-                  title="Critical attention"
+                  title="Stock attention"
                   subtitle={`${alertRows.length} positions need review`}
                 >
                   <div className="alerts">
@@ -743,7 +837,12 @@ export default function App() {
                           setLoc(r.location.id);
                         }}
                       >
-                        <span className="alert-icon">
+                        <span
+                          className={
+                            "alert-icon " +
+                            r.status.toLowerCase().replaceAll(" ", "-")
+                          }
+                        >
                           <ShieldAlert size={17} />
                         </span>
                         <span>
@@ -759,7 +858,9 @@ export default function App() {
                       </button>
                     ))}
                     {!alertRows.length && (
-                      <p className="empty">No critical or warning positions.</p>
+                      <p className="empty">
+                        No shortage positions in this scope.
+                      </p>
                     )}
                   </div>
                   <button
@@ -802,13 +903,16 @@ export default function App() {
                 >
                   <div className="top-products">
                     {products
-                      .filter((p) => !sku || p.id === sku)
+                      .filter((p) =>
+                        filtered.some((r) => r.product.id === p.id),
+                      )
                       .map((p) => ({
                         ...p,
                         total: state.sales
                           .filter(
                             (s) =>
-                              s.sku === p.id && (!loc || s.location === loc),
+                              s.sku === p.id &&
+                              positionKeys.has(s.sku + s.location),
                           )
                           .reduce((v, s) => v + s.quantity, 0),
                       }))
@@ -935,6 +1039,7 @@ export default function App() {
                         <th>Location / batch</th>
                         <th>Expiry</th>
                         <th>Packs</th>
+                        <th>Position status</th>
                         <th>Action</th>
                       </tr>
                     </thead>
@@ -962,22 +1067,40 @@ export default function App() {
                               {b.expiry}
                               <small
                                 className={
-                                  daysLeft(b.expiry) < 0 ? "red-text" : ""
+                                  daysLeft(b.expiry) < 0
+                                    ? "red-text"
+                                    : daysLeft(b.expiry) <= 90
+                                      ? "amber-text"
+                                      : "green-text"
                                 }
                               >
                                 {daysLeft(b.expiry) < 0
                                   ? "Expired — excluded"
-                                  : "In date"}
+                                  : daysLeft(b.expiry) <= 30
+                                    ? "Due within 30 days"
+                                    : daysLeft(b.expiry) <= 90
+                                      ? "Due within 90 days"
+                                      : "In date"}
                               </small>
                             </td>
                             <td>
                               <b>{fmt(b.quantity)}</b>
                             </td>
                             <td>
+                              <Badge
+                                value={
+                                  all.find((r) => r.key === b.sku + b.location)!
+                                    .status
+                                }
+                              />
+                              <small>All in-date batches at {l.city}</small>
+                            </td>
+                            <td>
                               <button
                                 className="button compact"
                                 onClick={() => {
                                   setEdit(b.id);
+                                  setReceiptRequest("");
                                   setDelta("");
                                   setReason("");
                                   setError("");
@@ -1027,15 +1150,23 @@ export default function App() {
                   <b>Lead-time aware early warnings</b>
                   <p>
                     Daily demand = last four weeks of sales ÷ 28. Coverage =
-                    usable packs ÷ daily demand. Critical: zero stock or
-                    coverage ≤ lead time. Warning: coverage ≤ lead time + 7
-                    days. Healthy: above that buffer.
+                    usable packs ÷ daily demand. Out of Stock: zero usable
+                    packs. Critical: positive stock with coverage ≤ lead time.
+                    Low Stock: lead time &lt; coverage ≤ lead time + 7 days.
+                    Healthy: above that buffer or positive stock with no recent
+                    demand. These categories are mutually exclusive.
                   </p>
                 </div>
               </div>
               <div className="section-title">
                 <div className="tabs">
-                  {["All", "Critical", "Warning", "Healthy"].map((v) => (
+                  {[
+                    "All",
+                    "Out of Stock",
+                    "Critical",
+                    "Low Stock",
+                    "Healthy",
+                  ].map((v) => (
                     <button
                       className={riskFilter === v ? "selected" : ""}
                       onClick={() => setRiskFilter(v)}
@@ -1073,28 +1204,10 @@ export default function App() {
             <>
               <div className="mini-kpis">
                 {[
-                  ["Expired", batches.filter((b) => daysLeft(b.expiry) < 0)],
-                  [
-                    "Within 30 days",
-                    batches.filter(
-                      (b) =>
-                        daysLeft(b.expiry) >= 0 && daysLeft(b.expiry) <= 30,
-                    ),
-                  ],
-                  [
-                    "Within 60 days",
-                    batches.filter(
-                      (b) =>
-                        daysLeft(b.expiry) >= 0 && daysLeft(b.expiry) <= 60,
-                    ),
-                  ],
-                  [
-                    "Within 90 days",
-                    batches.filter(
-                      (b) =>
-                        daysLeft(b.expiry) >= 0 && daysLeft(b.expiry) <= 90,
-                    ),
-                  ],
+                  ["Expired", expiry.expired],
+                  ["Due 0–30 days", expiry.within30],
+                  ["Due 31–60 days", expiry.days31to60],
+                  ["Due 61–90 days", expiry.days61to90],
                 ].map(([label, bs]) => (
                   <div className="card" key={String(label)}>
                     <span>{String(label)}</span>
@@ -1106,7 +1219,10 @@ export default function App() {
                         ),
                       )}
                     </strong>
-                    <small>packs · cumulative windows</small>
+                    <small>
+                      {(bs as typeof batches).length} stocked batches ·
+                      exclusive band
+                    </small>
                   </div>
                 ))}
               </div>
@@ -1117,7 +1233,8 @@ export default function App() {
                   <p>
                     Review in-date batches in expiry order within each SKU and
                     location. Expired inventory is excluded from usable stock.
-                    Redistribution and disposal require qualified human review;
+                    Expired medicines must not be redistributed. In-date
+                    redistribution and disposal require qualified human review;
                     neither is approved by this prototype.
                   </p>
                 </div>
@@ -1188,7 +1305,7 @@ export default function App() {
                           <td>{fmt(b.quantity)}</td>
                           <td>
                             {daysLeft(b.expiry) < 0
-                              ? "Segregate; seek authorised review"
+                              ? "Segregate; no redistribution. Seek authorised disposal review"
                               : state.batches.some(
                                     (other) =>
                                       other.sku === b.sku &&
@@ -1223,8 +1340,9 @@ export default function App() {
                     Target stock = daily demand × (lead time + safety days).
                     Suggested reorder = max(0, ceil(target − usable stock −
                     confirmed incoming)). Approved demo requests count as
-                    confirmed incoming; they are not received stock or actual
-                    purchase orders.
+                    outstanding confirmed incoming; matching a stock receipt
+                    reduces this incoming balance. They are not actual purchase
+                    orders.
                   </p>
                 </div>
               </div>
@@ -1238,7 +1356,12 @@ export default function App() {
                     max="90"
                     value={lead}
                     onChange={(e) =>
-                      setLead(Math.max(1, Math.min(90, Number(e.target.value))))
+                      setLead(
+                        Math.max(
+                          1,
+                          Math.min(90, Math.trunc(Number(e.target.value))),
+                        ),
+                      )
                     }
                   />
                 </label>
@@ -1252,7 +1375,10 @@ export default function App() {
                     value={safety}
                     onChange={(e) =>
                       setSafety(
-                        Math.max(0, Math.min(90, Number(e.target.value))),
+                        Math.max(
+                          0,
+                          Math.min(90, Math.trunc(Number(e.target.value))),
+                        ),
                       )
                     }
                   />
@@ -1341,64 +1467,64 @@ export default function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      {state.requests
-                        .filter(
-                          (r) =>
-                            (!sku || r.sku === sku) &&
-                            (!loc || r.location === loc),
-                        )
-                        .map((r) => (
-                          <tr key={r.id}>
-                            <td>
-                              {products.find((p) => p.id === r.sku)!.name}
-                            </td>
-                            <td>
-                              {locations.find((l) => l.id === r.location)!.city}
-                            </td>
-                            <td>{r.quantity}</td>
-                            <td>
-                              <Badge value={r.status} />
-                            </td>
-                            <td>
-                              {r.status !== "Approved" ? (
-                                <button
-                                  className="button compact"
-                                  onClick={() => {
-                                    const status =
-                                      r.status === "Draft"
-                                        ? "Pending Approval"
-                                        : "Approved";
-                                    save({
-                                      ...state,
-                                      requests: state.requests.map((q) =>
-                                        q.id === r.id ? { ...q, status } : q,
-                                      ),
-                                      audit: [
-                                        {
-                                          at: new Date().toISOString(),
-                                          action: "Demo request " + status,
-                                          detail: `${r.sku} · ${r.quantity} packs · no actual order placed`,
-                                        },
-                                        ...state.audit,
-                                      ],
-                                    });
-                                  }}
-                                >
-                                  {r.status === "Draft"
-                                    ? "Submit for review"
-                                    : "Simulate approval"}
-                                </button>
-                              ) : (
-                                <span className="green-text">
-                                  Confirmed incoming (demo)
-                                </span>
-                              )}
-                            </td>
-                          </tr>
-                        ))}
+                      {visibleRequests.map((r) => (
+                        <tr key={r.id}>
+                          <td>{products.find((p) => p.id === r.sku)!.name}</td>
+                          <td>
+                            {locations.find((l) => l.id === r.location)!.city}
+                          </td>
+                          <td>
+                            {r.quantity}
+                            <small>
+                              {r.received ?? 0} received ·{" "}
+                              {confirmedIncoming(r)} confirmed incoming
+                            </small>
+                          </td>
+                          <td>
+                            <Badge value={r.status} />
+                          </td>
+                          <td>
+                            {r.status !== "Approved" ? (
+                              <button
+                                className="button compact"
+                                onClick={() => {
+                                  const status =
+                                    r.status === "Draft"
+                                      ? "Pending Approval"
+                                      : "Approved";
+                                  save({
+                                    ...state,
+                                    requests: state.requests.map((q) =>
+                                      q.id === r.id ? { ...q, status } : q,
+                                    ),
+                                    audit: [
+                                      {
+                                        at: new Date().toISOString(),
+                                        action: "Demo request " + status,
+                                        detail: `${r.sku} · ${r.quantity} packs · no actual order placed`,
+                                      },
+                                      ...state.audit,
+                                    ],
+                                  });
+                                }}
+                              >
+                                {r.status === "Draft"
+                                  ? "Submit for review"
+                                  : "Simulate approval"}
+                              </button>
+                            ) : (
+                              <span className="green-text">
+                                {confirmedIncoming(r) > 0
+                                  ? "Confirmed incoming (demo)"
+                                  : "Fully received (demo)"}
+                              </span>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
                     </tbody>
                   </table>
-                  {!state.requests.length && (
+                  {!visibleRequests.length && (
                     <p className="empty">
                       No requests yet. Create a draft from a recommendation
                       above.
@@ -1460,7 +1586,7 @@ export default function App() {
                   </div>
                   <div>
                     <strong>{exp.length}</strong>
-                    <span>expiry-risk batches</span>
+                    <span>in-date batches due within 90 days</span>
                   </div>
                   <div>
                     <strong>{pending.length}</strong>
@@ -1530,7 +1656,9 @@ export default function App() {
             <h2 id="reset-title">Reset demonstration data?</h2>
             <p>
               This clears all local stock changes, requests and audit history,
-              then generates fresh synthetic data relative to today.
+              then generates the revised synthetic scenarios relative to today.
+              Your existing transactions are retained until you confirm this
+              reset.
             </p>
             <div className="actions">
               <button
@@ -1566,7 +1694,15 @@ export default function App() {
             onSubmit={(e) => {
               e.preventDefault();
               try {
-                save(changeStock(state, edit, Number(delta), reason));
+                save(
+                  changeStock(
+                    state,
+                    edit,
+                    Number(delta),
+                    reason,
+                    receiptRequest || undefined,
+                  ),
+                );
                 setEdit(null);
                 setNotice(
                   "Stock movement saved. Metrics and recommendations have been recalculated.",
@@ -1602,6 +1738,31 @@ export default function App() {
                 placeholder="e.g. Demo receipt, physical count correction"
               />
             </label>
+            <label>
+              Match confirmed incoming (optional)
+              <select
+                aria-label="Match confirmed incoming"
+                value={receiptRequest}
+                onChange={(e) => setReceiptRequest(e.target.value)}
+              >
+                <option value="">Separate demo receipt / adjustment</option>
+                {state.requests
+                  .filter((r) => {
+                    const b = state.batches.find((b) => b.id === edit)!;
+                    return (
+                      r.sku === b.sku &&
+                      r.location === b.location &&
+                      confirmedIncoming(r) > 0
+                    );
+                  })
+                  .map((r) => (
+                    <option key={r.id} value={r.id}>
+                      {confirmedIncoming(r)} outstanding packs ·{" "}
+                      {r.id.slice(0, 8)}
+                    </option>
+                  ))}
+              </select>
+            </label>
             {error && (
               <p role="alert" className="red-text">
                 {error}
@@ -1609,7 +1770,9 @@ export default function App() {
             )}
             <p className="muted">
               Receipts are recorded against this existing batch and retain its
-              expiry date. No actual stock is moved.
+              expiry date. Unmatched receipts represent separate demo stock;
+              match an approved request below when receiving its incoming
+              quantity. No actual stock is moved.
             </p>
             <div className="actions">
               <button

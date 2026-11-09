@@ -25,10 +25,12 @@ export type Request = {
   location: string;
   quantity: number;
   status: "Draft" | "Pending Approval" | "Approved";
+  received?: number;
 };
 export type Audit = { at: string; action: string; detail: string };
 export type State = {
   version: 1;
+  seedRevision?: number;
   anchor: string;
   batches: Batch[];
   sales: Sale[];
@@ -100,43 +102,143 @@ export const products: Product[] = names.map((name, i) => ({
   form: ["Tablet", "Capsule", "Syrup", "Suspension"][i % 4],
   pack: i % 4 < 2 ? "Strip of 10" : "Bottle 100 ml",
 }));
-export const day = (date: string) => Date.parse(date + "T00:00:00Z");
-export const today = () => new Date().toISOString().slice(0, 10);
+export const day = (date: string) => {
+  if (typeof date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return NaN;
+  const time = Date.parse(date + "T00:00:00Z");
+  return Number.isFinite(time) &&
+    new Date(time).toISOString().slice(0, 10) === date
+    ? time
+    : NaN;
+};
+export const today = (now = new Date()) =>
+  new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(now);
 export const daysLeft = (expiry: string, asOf = today()) =>
   Math.ceil((day(expiry) - day(asOf)) / 86400000);
+// Stable hash streams vary demand, coverage and expiry independently across positions.
+function sample(index: number, stream: number) {
+  let n = Math.imul(index + 1, 0x45d9f3b) ^ Math.imul(stream + 1, 0x27d4eb2d);
+  n = Math.imul(n ^ (n >>> 16), 0x45d9f3b);
+  return ((n ^ (n >>> 16)) >>> 0) / 4294967296;
+}
 export function seed(anchor = today()): State {
   const batches: Batch[] = [],
     sales: Sale[] = [];
   products.forEach((p, i) =>
     locations.forEach((l, j) => {
-      const daily = 2 + ((i * 7 + j * 3) % 18);
-      for (let w = 0; w < 12; w++)
+      const index = i * locations.length + j;
+      const pace = sample(index, 0);
+      const daily =
+        pace < 0.06
+          ? 0
+          : pace < 0.2
+            ? 0.3 + sample(index, 1)
+            : 3 + sample(index, 1) * 20;
+      for (let week = 0; week < 12; week++)
         sales.push({
           sku: p.id,
           location: l.id,
-          week: w,
+          week,
           quantity: Math.round(
-            daily * 7 * (0.8 + w * 0.025 + ((i + j + w) % 5) * 0.07),
+            daily *
+              7 *
+              (0.85 + week * 0.015 + sample(index * 12 + week, 2) * 0.3),
           ),
         });
-      const coverage = [0, 3, 9, 24, 50, 75][(i + j) % 6];
-      [0, 1].forEach((k) =>
+      const observedDaily = dailyDemand(sales, p.id, l.id);
+      // Inventory coverage is independent of expiry; no dashboard totals are hard-coded.
+      const level = sample(index, 3);
+      const coverage =
+        level < 0.08
+          ? 0
+          : level < 0.22
+            ? l.lead * 0.6
+            : level < 0.42
+              ? l.lead + 3
+              : 22 + sample(index, 4) * 48;
+      const total =
+        coverage === 0
+          ? 0
+          : Math.max(1, Math.round((observedDaily || 0.4) * coverage));
+      const first = Math.round(total * 0.6);
+      [0, 1].forEach((k) => {
+        const e = sample(index * 2 + k, 5);
+        const offset =
+          e < 0.035
+            ? -1 - Math.floor(e * 300)
+            : e < 0.18
+              ? 1 + Math.floor(sample(index * 2 + k, 6) * 90)
+              : 120 + Math.floor(sample(index * 2 + k, 6) * 300);
         batches.push({
           id: `B-${i + 1}-${j + 1}-${k + 1}`,
           sku: p.id,
           location: l.id,
-          quantity: Math.round(daily * coverage * (k === 0 ? 0.6 : 0.4)),
-          expiry: new Date(
-            day(anchor) +
-              [-12, 18, 45, 75, 150, 280][(i + j + k) % 6] * 86400000,
-          )
+          quantity: k === 0 ? first : total - first,
+          expiry: new Date(day(anchor) + offset * 86400000)
             .toISOString()
             .slice(0, 10),
-        }),
-      );
+        });
+      });
     }),
   );
-  return { version: 1, anchor, batches, sales, requests: [], audit: [] };
+  return {
+    version: 1,
+    seedRevision: 2,
+    anchor,
+    batches,
+    sales,
+    requests: [],
+    audit: [],
+  };
+}
+export type StockStatus = "Out of Stock" | "Critical" | "Low Stock" | "Healthy";
+export function inExpiryWindow(batch: Batch, days: number, asOf = today()) {
+  const left = daysLeft(batch.expiry, asOf);
+  return batch.quantity > 0 && left >= 0 && left <= days;
+}
+export function expirySummary(batches: Batch[], asOf = today()) {
+  const stocked = batches.filter((b) => b.quantity > 0);
+  return {
+    expired: stocked.filter((b) => daysLeft(b.expiry, asOf) < 0),
+    within30: stocked.filter((b) => inExpiryWindow(b, 30, asOf)),
+    within60: stocked.filter((b) => inExpiryWindow(b, 60, asOf)),
+    within90: stocked.filter((b) => inExpiryWindow(b, 90, asOf)),
+    // Exclusive bands can safely be added; cumulative windows above cannot.
+    days31to60: stocked.filter(
+      (b) => daysLeft(b.expiry, asOf) > 30 && daysLeft(b.expiry, asOf) <= 60,
+    ),
+    days61to90: stocked.filter(
+      (b) => daysLeft(b.expiry, asOf) > 60 && daysLeft(b.expiry, asOf) <= 90,
+    ),
+  };
+}
+export function summarizePositions(
+  positions: { product: { id: string }; stock: number; status: StockStatus }[],
+) {
+  const count = (status: StockStatus) =>
+    positions.filter((r) => r.status === status).length;
+  const out = count("Out of Stock");
+  return {
+    activeSkus: new Set(positions.map((r) => r.product.id)).size,
+    positions: positions.length,
+    out,
+    critical: count("Critical"),
+    low: count("Low Stock"),
+    healthy: count("Healthy"),
+    usable: positions.reduce((sum, r) => sum + r.stock, 0),
+    availability: positions.length
+      ? ((positions.length - out) / positions.length) * 100
+      : null,
+  };
+}
+export function confirmedIncoming(request: Request) {
+  return request.status === "Approved"
+    ? Math.max(0, request.quantity - (request.received ?? 0))
+    : 0;
 }
 export function usable(
   batches: Batch[],
@@ -156,21 +258,39 @@ export function usable(
 export function dailyDemand(sales: Sale[], sku: string, location: string) {
   return (
     sales
-      .filter((s) => s.sku === sku && s.location === location && s.week >= 8)
+      .filter(
+        (s) =>
+          s.sku === sku &&
+          s.location === location &&
+          s.week >= 8 &&
+          s.week <= 11,
+      )
       .reduce((v, s) => v + s.quantity, 0) / 28
   );
 }
-export function risk(stock: number, daily: number, lead: number) {
+export function risk(
+  stock: number,
+  daily: number,
+  lead: number,
+): { coverage: number; status: StockStatus } {
+  if (
+    ![stock, daily, lead].every(Number.isFinite) ||
+    stock < 0 ||
+    daily < 0 ||
+    !Number.isInteger(lead) ||
+    lead < 1
+  )
+    throw new Error("Invalid stock, demand or lead time.");
   const coverage = daily > 0 ? stock / daily : Infinity;
   return {
     coverage,
     status:
       stock === 0
-        ? "Critical"
+        ? "Out of Stock"
         : coverage <= lead
           ? "Critical"
           : coverage <= lead + 7
-            ? "Warning"
+            ? "Low Stock"
             : "Healthy",
   };
 }
@@ -181,6 +301,19 @@ export function reorder(
   safety: number,
   incoming = 0,
 ) {
+  if (
+    ![stock, daily, lead, safety, incoming].every(Number.isFinite) ||
+    stock < 0 ||
+    daily < 0 ||
+    incoming < 0 ||
+    !Number.isInteger(lead) ||
+    lead < 1 ||
+    !Number.isInteger(safety) ||
+    safety < 0
+  )
+    throw new Error(
+      "Use nonnegative finite stock and demand, positive whole lead days and nonnegative whole safety days.",
+    );
   const target = daily * (lead + safety);
   return {
     target,
@@ -198,7 +331,7 @@ export function rows(state: State, leadOverride?: number, safety = 7) {
           (r) =>
             r.sku === p.id && r.location === l.id && r.status === "Approved",
         )
-        .reduce((s, r) => s + r.quantity, 0);
+        .reduce((s, r) => s + confirmedIncoming(r), 0);
       return {
         key: p.id + l.id,
         product: p,
@@ -218,15 +351,40 @@ export function changeStock(
   id: string,
   delta: number,
   reason: string,
+  requestId?: string,
 ): State {
-  if (!Number.isInteger(delta) || delta === 0 || !reason.trim())
+  if (!Number.isSafeInteger(delta) || delta === 0 || !reason.trim())
     throw new Error("Enter a nonzero whole number and a reason.");
   const batch = state.batches.find((b) => b.id === id);
   if (!batch) throw new Error("Batch not found.");
+  if (!Number.isSafeInteger(batch.quantity + delta))
+    throw new Error("Movement exceeds the safe whole-pack range.");
   if (batch.quantity + delta < 0)
     throw new Error("Adjustment would create a negative balance.");
+  const request = requestId
+    ? state.requests.find((r) => r.id === requestId)
+    : undefined;
+  if (
+    requestId &&
+    (!request ||
+      delta <= 0 ||
+      request.sku !== batch.sku ||
+      request.location !== batch.location ||
+      daysLeft(batch.expiry) < 0 ||
+      delta > confirmedIncoming(request))
+  )
+    throw new Error(
+      "Receipt must match an approved request, an in-date batch and its outstanding quantity.",
+    );
   return {
     ...state,
+    requests: request
+      ? state.requests.map((r) =>
+          r.id === request.id
+            ? { ...r, received: (r.received ?? 0) + delta }
+            : r,
+        )
+      : state.requests,
     batches: state.batches.map((b) =>
       b.id === id ? { ...b, quantity: b.quantity + delta } : b,
     ),
@@ -234,7 +392,7 @@ export function changeStock(
       {
         at: new Date().toISOString(),
         action: delta > 0 ? "Stock receipt / increase" : "Stock adjustment",
-        detail: `${id}: ${delta > 0 ? "+" : ""}${delta} packs. ${reason.trim()}`,
+        detail: `${id}: ${delta > 0 ? "+" : ""}${delta} packs. ${reason.trim()}${request ? ` · matched request ${request.id}` : ""}`,
       },
       ...state.audit,
     ],
@@ -279,6 +437,10 @@ export function validState(value: unknown): value is State {
         locations.some((l) => l.id === r.location) &&
         Number.isInteger(r.quantity) &&
         r.quantity > 0 &&
+        (r.received === undefined ||
+          (Number.isInteger(r.received) &&
+            r.received >= 0 &&
+            r.received <= r.quantity)) &&
         ["Draft", "Pending Approval", "Approved"].includes(r.status),
     ) &&
     Array.isArray(s.audit) &&
@@ -289,4 +451,31 @@ export function validState(value: unknown): value is State {
         typeof a.detail === "string",
     )
   );
+}
+
+// Seed revision is metadata, not a reason to overwrite a valid version-1 ledger.
+export const storageKey = "pharmasetu-demo-v1";
+export function restoreDemo(raw: string | null): {
+  state: State;
+  notice: string;
+} {
+  if (!raw) return { state: seed(), notice: "" };
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (validState(parsed))
+      return {
+        state: parsed,
+        notice:
+          parsed.seedRevision === 2
+            ? ""
+            : "Your saved demo ledger is preserved. Revised synthetic scenarios are available through Reset demo data (confirmation required); resetting removes your local transactions.",
+      };
+  } catch {
+    /* Preserve the original storage entry; this function never writes. */
+  }
+  return {
+    state: seed(),
+    notice:
+      "Saved demo data could not be loaded. A temporary synthetic dataset is shown; the stored entry has not been changed. Export or back up your existing browser data before saving or resetting.",
+  };
 }
